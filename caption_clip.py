@@ -1,17 +1,20 @@
 """
 Batch-caption all video clips under a clips directory using AVoCaDO.
 
-Mirrors the folder structure from data/clips/ into data/captions/,
-saving one JSON per clip with the same stem name. Loads one model per GPU
-and supports resume (skips clips that already have a caption JSON).
-Re-scans for new clips after each batch.
+Continuously watches data/clips/ for new un-captioned clips, mirrors the
+folder structure into data/captions/, saving one JSON per clip. Loads one
+model per GPU and is fully resumable (skips clips that already have a
+caption JSON). Re-scans for new clips after each batch.
 
 Usage:
     # Single GPU:
-    python caption_clip.py data/clips/ --gpus 0
+    python caption_clip.py --gpus 0
 
     # Multi-GPU:
-    python caption_clip.py data/clips/ --gpus 0,1,2,3
+    python caption_clip.py --gpus 0,1,2,3
+
+    # Run once (no polling):
+    python caption_clip.py --gpus 0 --poll-interval 0
 """
 
 import argparse
@@ -85,6 +88,8 @@ def load_clip_metadata(movie_dir: Path) -> dict:
 
 def scan_pending(clips_dir: Path, captions_dir: Path) -> List[tuple]:
     """Scan clips_dir for un-captioned clips. Returns (movie_dir, clip_path) pairs."""
+    if not clips_dir.is_dir():
+        return []
     todo = []
     for movie_dir in sorted(clips_dir.iterdir()):
         if not movie_dir.is_dir():
@@ -114,7 +119,7 @@ def _build_conversation(file_path: str, prompt: str) -> list:
 
 
 def _save_caption(clip_path, caption, prompt, model_path, captions_dir, meta_cache):
-    """Write one caption JSON to disk. Returns True on success."""
+    """Write one caption JSON to disk."""
     movie_dir = clip_path.parent
     movie_name = movie_dir.name
 
@@ -216,7 +221,7 @@ def worker_process(
     rng = random.Random(seed + gpu_id)
     meta_cache = {}
 
-    # Filter out already-captioned clips
+    # Filter out already-captioned clips (double-check at worker start)
     pending = []
     for movie_dir_str, clip_path_str in assigned_clips:
         clip_path = Path(clip_path_str)
@@ -225,7 +230,6 @@ def worker_process(
             pending.append((movie_dir_str, clip_path_str))
 
     # Process in batches
-    total_batches = (len(pending) + batch_size - 1) // batch_size
     pbar = tqdm(total=len(pending), desc=f"[GPU {gpu_id}]", dynamic_ncols=True)
 
     for batch_start in range(0, len(pending), batch_size):
@@ -258,17 +262,25 @@ def worker_process(
 
 def main():
     parser = argparse.ArgumentParser(description="Batch-caption video clips with AVoCaDO (multi-GPU)")
-    parser.add_argument("clips_dir", type=str, help="Path to clips directory (e.g. data/clips/)")
-    parser.add_argument("--captions-dir", type=str, default="data/captions", help="Output captions directory")
-    parser.add_argument("--model", type=str, default="AVoCaDO-Captioner/AVoCaDO", help="Model path or HuggingFace ID")
-    parser.add_argument("--gpus", type=str, default="0", help="Comma-separated GPU IDs (e.g. 0,1,2,3)")
-    parser.add_argument("--seed", type=int, default=1234, help="Random seed for prompt selection")
-    parser.add_argument("--batch-size", type=int, default=1, help="Number of clips per forward pass per GPU")
-    parser.add_argument("--poll-interval", type=int, default=60, help="Seconds to wait before re-scanning for new clips (0 to exit when done)")
+    parser.add_argument("--clips-dir", type=str, default="data/clips",
+                        help="Path to clips directory (default: data/clips)")
+    parser.add_argument("--captions-dir", type=str, default="data/captions",
+                        help="Output captions directory (default: data/captions)")
+    parser.add_argument("--model", type=str, default="AVoCaDO-Captioner/AVoCaDO",
+                        help="Model path or HuggingFace ID")
+    parser.add_argument("--gpus", type=str, default="0",
+                        help="Comma-separated GPU IDs (e.g. 0,1,2,3)")
+    parser.add_argument("--seed", type=int, default=1234,
+                        help="Random seed for prompt selection")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Number of clips per forward pass per GPU")
+    parser.add_argument("--poll-interval", type=int, default=60,
+                        help="Seconds between re-scans for new clips (0 to exit when done)")
     args = parser.parse_args()
 
     clips_dir = Path(args.clips_dir).resolve()
     captions_dir = Path(args.captions_dir).resolve()
+    captions_dir.mkdir(parents=True, exist_ok=True)
     gpu_ids = [int(x) for x in args.gpus.split(",") if x.strip()]
 
     if not gpu_ids:
@@ -319,6 +331,9 @@ def main():
             print(f"WARNING: some workers exited non-zero: {exit_codes}", file=sys.stderr, flush=True)
 
         print("Batch done. Re-scanning for new clips...", flush=True)
+
+        if args.poll_interval <= 0:
+            break
 
 
 if __name__ == "__main__":

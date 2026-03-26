@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []
+
+[project]
+name = "avocado"
+version = "0.1.0"
+description = "AVoCaDO – movie downloading, clipping, and captioning pipeline"
+requires-python = ">=3.10,<3.11"
+
+dependencies = [
+    # --- downloading ---
+    "requests>=2.32",
+    # --- scene detection & clipping ---
+    "scenedetect>=0.6.4",
+    "opencv-python-headless>=4.10",
+    # --- captioning (Qwen2.5-Omni) ---
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+    "transformers>=4.52",
+    "accelerate>=0.34",
+    "qwen-omni-utils>=0.0.8",
+    "flash-attn>=2.7",
+    # --- shared utilities ---
+    "tqdm>=4.67",
+    "numpy>=1.26,<2",
+    "ffmpeg-python>=0.2",
+    "huggingface-hub>=0.33",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+]

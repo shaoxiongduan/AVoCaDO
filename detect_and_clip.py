@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Detect scene transitions and generate 5-second clips from raw movies.
 
-Single-script replacement for the pipeline's scene_detect + clip_gen stages.
-Outputs clips to data/clips/{movie_name}/ with per-movie metadata.
+Continuously watches data/raw_movies/ for new movies, runs scene detection
+and clip generation, and saves clips to data/clips/{movie_name}/. Fully
+resumable — skips movies that already have clip_metadata.json.
 
 Usage:
     python detect_and_clip.py
     python detect_and_clip.py --input data/raw_movies --output data/clips
     python detect_and_clip.py --clip-duration 5 --skip-start 300 --threshold 27
-    python detect_and_clip.py --workers 4
+    python detect_and_clip.py --workers 4 --poll-interval 60
+    python detect_and_clip.py --poll-interval 0   # exit when done (no polling)
 """
 
 import argparse
@@ -16,6 +18,7 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -151,6 +154,19 @@ def generate_clips(
         clip_name = f"{video_stem}_clip_{idx:04d}_{t_start:.2f}s.mp4"
         clip_path = output_dir / clip_name
 
+        # Skip clips that already exist (resume support within a movie)
+        if clip_path.exists() and clip_path.stat().st_size > 0:
+            meta = {
+                "clip_path": str(clip_path),
+                "source_video": str(video_path),
+                "start_time": t_start,
+                "end_time": t_end,
+                "num_internal_transitions": internal_count,
+                "num_frames": num_frames,
+            }
+            clips_metadata.append(meta)
+            continue
+
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(t_start),
@@ -248,6 +264,26 @@ def process_movie(
 
 
 # ---------------------------------------------------------------------------
+# Scanning
+# ---------------------------------------------------------------------------
+
+def scan_pending(input_dir: Path, output_dir: Path) -> list[Path]:
+    """Find movies in input_dir that don't yet have clip_metadata.json in output_dir."""
+    if not input_dir.is_dir():
+        return []
+    all_videos = sorted(
+        p for p in input_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+    )
+    pending = []
+    for v in all_videos:
+        meta_file = output_dir / v.stem / "clip_metadata.json"
+        if not meta_file.exists():
+            pending.append(v)
+    return pending
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -256,7 +292,7 @@ def main():
         description="Detect scene transitions and generate 5s clips from raw movies."
     )
     parser.add_argument("--input", type=Path, default=Path("data/raw_movies"),
-                        help="Directory of movies or a single video file (default: data/raw_movies)")
+                        help="Directory of movies (default: data/raw_movies)")
     parser.add_argument("--output", type=Path, default=Path("data/clips"),
                         help="Output root directory for clips (default: data/clips)")
 
@@ -288,45 +324,14 @@ def main():
     # Execution options
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of parallel workers (default: 1)")
-    parser.add_argument("--resume", action="store_true", default=True,
-                        help="Skip movies that already have a clips folder (default: True)")
-    parser.add_argument("--no-resume", action="store_false", dest="resume",
-                        help="Re-process all movies even if clips exist")
+    parser.add_argument("--poll-interval", type=int, default=60,
+                        help="Seconds between re-scans for new movies (0 to exit when done)")
 
     args = parser.parse_args()
 
-    # Discover movies — input can be a directory or a single file
-    input_path = args.input.resolve()
-    if input_path.is_file():
-        all_videos = [input_path]
-    elif input_path.is_dir():
-        all_videos = sorted(
-            p for p in input_path.iterdir()
-            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
-        )
-    else:
-        logger.error(f"Input not found: {input_path}")
-        sys.exit(1)
-    logger.info(f"Found {len(all_videos)} video files in {input_path}")
-
-    # Filter already-processed movies if resuming
+    input_dir = args.input.resolve()
     output_dir = args.output.resolve()
-    if args.resume:
-        videos = []
-        for v in all_videos:
-            movie_out = output_dir / v.stem
-            meta_file = movie_out / "clip_metadata.json"
-            if meta_file.exists():
-                logger.info(f"Skipping (already processed): {v.name}")
-            else:
-                videos.append(v)
-        logger.info(f"{len(videos)} movies to process ({len(all_videos) - len(videos)} already done)")
-    else:
-        videos = all_videos
-
-    if not videos:
-        logger.info("Nothing to process.")
-        return
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Common kwargs for process_movie
     kwargs = dict(
@@ -343,48 +348,69 @@ def main():
         num_frames=args.num_frames,
     )
 
-    results = []
+    cumulative_results = []
 
-    if args.workers <= 1:
-        # Sequential processing – nicer progress output
-        for i, video in enumerate(videos, 1):
-            logger.info(f"\n[{i}/{len(videos)}] ========================")
-            result = process_movie(video_path=video, **kwargs)
-            results.append(result)
-    else:
-        # Parallel processing
-        with ProcessPoolExecutor(max_workers=args.workers) as executor:
-            futures = {
-                executor.submit(process_movie, video_path=v, **kwargs): v
-                for v in videos
-            }
-            for future in as_completed(futures):
-                video = futures[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    logger.error(f"Worker failed for {video.name}: {e}")
-                    results.append({"movie": video.stem, "error": str(e), "clips": 0})
+    while True:
+        videos = scan_pending(input_dir, output_dir)
 
-    # Summary
-    total_clips = sum(r.get("clips", 0) for r in results)
-    errors = [r for r in results if "error" in r]
+        if not videos:
+            if args.poll_interval <= 0:
+                logger.info("All done. No pending movies.")
+                break
+            logger.info(f"No pending movies. Waiting {args.poll_interval}s...")
+            time.sleep(args.poll_interval)
+            continue
 
-    logger.info("\n========== SUMMARY ==========")
-    logger.info(f"Movies processed: {len(results)}")
-    logger.info(f"Total clips generated: {total_clips}")
-    if errors:
-        logger.warning(f"Errors: {len(errors)}")
-        for e in errors:
-            logger.warning(f"  {e['movie']}: {e['error']}")
+        logger.info(f"Found {len(videos)} new movies to process.")
 
-    # Save global summary
-    summary_path = output_dir / "processing_summary.json"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with open(summary_path, "w") as f:
-        json.dump(results, f, indent=2)
-    logger.info(f"Summary saved to {summary_path}")
+        results = []
+
+        if args.workers <= 1:
+            for i, video in enumerate(videos, 1):
+                logger.info(f"\n[{i}/{len(videos)}] ========================")
+                result = process_movie(video_path=video, **kwargs)
+                results.append(result)
+        else:
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(process_movie, video_path=v, **kwargs): v
+                    for v in videos
+                }
+                for future in as_completed(futures):
+                    video = futures[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        logger.error(f"Worker failed for {video.name}: {e}")
+                        results.append({"movie": video.stem, "error": str(e), "clips": 0})
+
+        # Batch summary
+        total_clips = sum(r.get("clips", 0) for r in results)
+        errors = [r for r in results if "error" in r]
+        logger.info(f"\n--- Batch summary: {len(results)} movies, {total_clips} clips ---")
+        if errors:
+            for e in errors:
+                logger.warning(f"  Error: {e['movie']}: {e['error']}")
+
+        cumulative_results.extend(results)
+
+        # Save cumulative summary (append-safe)
+        summary_path = output_dir / "processing_summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(cumulative_results, f, indent=2)
+
+        if args.poll_interval <= 0:
+            break
+
+        logger.info(f"Re-scanning in {args.poll_interval}s...")
+        time.sleep(args.poll_interval)
+
+    # Final summary
+    total = sum(r.get("clips", 0) for r in cumulative_results)
+    logger.info(f"\n========== FINAL SUMMARY ==========")
+    logger.info(f"Total movies processed: {len(cumulative_results)}")
+    logger.info(f"Total clips generated: {total}")
 
 
 if __name__ == "__main__":
